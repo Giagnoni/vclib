@@ -2,6 +2,8 @@
     "C_Cpp.intelliSenseEngine": "disabled",
     "cmake.copyCompileCommands": "${workspaceFolder}/compile_commands.json",
     "cmake.generator": "Ninja",
+    "C_Cpp.formatting": "clangFormat",
+    "editor.formatOnSave": true,
     "cmake.languageSupport.enabled": true,
     "doxygen_runner.configuration_file_override": "${workspaceFolder}/docs/Doxyfile"
 }

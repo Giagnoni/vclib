@@ -29,12 +29,18 @@ namespace vcl {
 
 namespace detail {
 
+struct Texture2DGroupData
+{
+    Lib3MF::PTexture2DGroup group;
+    int                     materialIndex = -1;
+};
+
 struct ResourcesMap
 {
     std::unordered_map<uint, Lib3MF::PBaseMaterialGroup> baseMaterialGroupsMap;
     std::unordered_map<uint, Lib3MF::PColorGroup>        colorGroupsMap;
-    std::unordered_map<uint, Lib3MF::PTexture2DGroup>    texture2DGroupsMap;
-    std::unordered_map<uint, int>                        materialIndicesMap;
+    std::unordered_map<uint, Texture2DGroupData>         texture2DGroupsMap;
+    std::unordered_map<uint, int>                        textureToMaterialIndexMap;
     std::unordered_map<uint, Lib3MF::ePropertyType>      propertyTypesMap;
 };
 
@@ -141,6 +147,11 @@ int read3mfTexture(
     const Lib3MF::PAttachment& textureAttachment,
     const LoadSettings&        settings)
 {
+    if (!textureAttachment || !textureProperty) {
+        throw MalformedFileException(
+            "Texture attachment or property not found in 3MF package");
+    }
+
     Material                mat;
     vcl::TextureDescriptor& texture =
         mat.textureDescriptor(Material::TextureType::BASE_COLOR);
@@ -187,7 +198,7 @@ template<MeshConcept MeshType>
 bool readTriangleBaseMaterial(
     MeshType&             m,
     uint                  uniqueResourceID,
-    uint                  propertyID[3],
+    const uint            propertyID[3],
     uint                  faceID,
     const Lib3MF::PModel& model,
     bool                  enableOptionalComponents,
@@ -219,7 +230,7 @@ template<MeshConcept MeshType>
 bool readTriangleColors(
     MeshType&             m,
     uint                  uniqueResourceID,
-    uint                  propertyID[3],
+    const uint            propertyID[3],
     uint                  faceID,
     const Lib3MF::PModel& model,
     bool                  enableOptionalComponents,
@@ -251,7 +262,7 @@ template<MeshConcept MeshType>
 bool readTriangleTexCoords(
     MeshType&             m,
     uint                  uniqueResourceID,
-    uint                  propertyID[3],
+    const uint            propertyID[3],
     uint                  faceID,
     const Lib3MF::PModel& model,
     const LoadSettings&   settings,
@@ -261,27 +272,33 @@ bool readTriangleTexCoords(
         HasMaterials<MeshType> && HasPerFaceWedgeTexCoords<MeshType> &&
         HasPerFaceMaterialIndex<MeshType>) {
         if (canStoreFaceTexCoords(m, settings.enableOptionalComponents)) {
-            auto& tcg = resourcesMap.texture2DGroupsMap[uniqueResourceID];
-            if (!tcg) {
-                tcg = model->GetTexture2DGroupByID(uniqueResourceID);
-            }
+            auto& groupData = resourcesMap.texture2DGroupsMap[uniqueResourceID];
+            if (!groupData.group) {
+                groupData.group =
+                    model->GetTexture2DGroupByID(uniqueResourceID);
+                const auto tex2D = groupData.group->GetTexture2D();
+                if (!tex2D) {
+                    throw MalformedFileException(
+                        "3MF Texture2DGroup is missing Texture2D reference");
+                }
+                const uint tex2DId = tex2D->GetUniqueResourceID();
 
-            auto mIndex =
-                resourcesMap.materialIndicesMap
-                    .try_emplace(tcg->GetTexture2D()->GetUniqueResourceID(), -1)
-                    .first;
+                auto [it, inserted] =
+                    resourcesMap.textureToMaterialIndexMap.try_emplace(
+                        tex2DId, -1);
+                if (inserted || it->second == -1) {
+                    const auto a = tex2D->GetAttachment();
+                    it->second   = read3mfTexture(m, tex2D, a, settings);
+                }
 
-            if (mIndex->second == -1) {
-                const auto a = tcg->GetTexture2D()->GetAttachment();
-                mIndex->second =
-                    read3mfTexture(m, tcg->GetTexture2D(), a, settings);
+                groupData.materialIndex = it->second;
             }
 
             using WedgeTexCoordType = MeshType::FaceType::WedgeTexCoordType;
 
-            const auto& uv0 = tcg->GetTex2Coord(propertyID[0]);
-            const auto& uv1 = tcg->GetTex2Coord(propertyID[1]);
-            const auto& uv2 = tcg->GetTex2Coord(propertyID[2]);
+            const auto& uv0 = groupData.group->GetTex2Coord(propertyID[0]);
+            const auto& uv1 = groupData.group->GetTex2Coord(propertyID[1]);
+            const auto& uv2 = groupData.group->GetTex2Coord(propertyID[2]);
 
             m.face(faceID).wedgeTexCoord(0) =
                 WedgeTexCoordType(uv0.m_U, uv0.m_V);
@@ -290,7 +307,7 @@ bool readTriangleTexCoords(
             m.face(faceID).wedgeTexCoord(2) =
                 WedgeTexCoordType(uv2.m_U, uv2.m_V);
 
-            m.face(faceID).materialIndex() = mIndex->second;
+            m.face(faceID).materialIndex() = groupData.materialIndex;
 
             return true;
         }
@@ -303,7 +320,7 @@ template<MeshConcept MeshType>
 void readTriangleProperties(
     MeshType&             m,
     uint                  uniqueResourceID,
-    uint                  propertyID[3],
+    const uint            propertyID[3],
     uint                  faceID,
     const Lib3MF::PModel& model,
     const LoadSettings&   settings,
@@ -418,14 +435,14 @@ void readMeshObject(
 
     read3mfVertices(newMesh, vertices);
     newInfos.setVertices();
-    newInfos.setPerVertexPosition();
+    newInfos.setVertexPosition();
 
     if constexpr (HasFaces<MeshType>) {
         read3mfTriangles(newMesh, triangles);
 
         newInfos.setTriangleMesh();
         newInfos.setFaces();
-        newInfos.setPerFaceVertexReferences();
+        newInfos.setFaceVertexReferences();
     }
 
     if constexpr (HasTransformMatrix<MeshType>) {
@@ -449,11 +466,11 @@ void readMeshObject(
     }
 
     if constexpr (HasFaces<MeshType>) {
-        const uint                  nTriangles = meshObject->GetTriangleCount();
-        Lib3MF::sTriangleProperties triangleProperties;
+        std::vector<Lib3MF::sTriangleProperties> allTriangleProperties;
+        meshObject->GetAllTriangleProperties(allTriangleProperties);
 
-        for (uint i = 0; i < nTriangles; i++) {
-            meshObject->GetTriangleProperties(i, triangleProperties);
+        for (uint i = 0; i < allTriangleProperties.size(); i++) {
+            const auto& triangleProperties = allTriangleProperties[i];
 
             if (triangleProperties.m_ResourceID != 0) {
                 readTriangleProperties(
@@ -469,11 +486,11 @@ void readMeshObject(
         }
 
         if (infoFlags.faceColorsFlag)
-            newInfos.setPerFaceColor();
+            newInfos.setFaceColor();
         if (infoFlags.faceTexCoordsFlag) {
             newInfos.setMaterials();
-            newInfos.setPerFaceMaterialIndex();
-            newInfos.setPerFaceWedgeTexCoords();
+            newInfos.setFaceMaterialIndex();
+            newInfos.setFaceWedgeTexCoords();
         }
     }
 
@@ -532,6 +549,10 @@ void load3mf(
     const LoadSettings&    settings = LoadSettings(),
     LogType&               log      = nullLogger)
 {
+    if (!FileInfo::exists(filename)) {
+        throw CannotOpenFileException(filename);
+    }
+
     try {
         // entrypoint to the 3MF library
         Lib3MF::PWrapper wrapper = Lib3MF::CWrapper::loadLibrary();
@@ -569,7 +590,7 @@ void load3mf(
         }
     }
     catch (Lib3MF::ELib3MFException& e) {
-        throw CannotOpenFileException(
+        throw MalformedFileException(
             "Failed to load 3MF file: " + filename + ":\n" + e.what());
     }
 }
